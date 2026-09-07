@@ -3,6 +3,10 @@
 **Status:** Design / Spec (pre-implementation)
 **Author:** Nitish Chauhan (spec drafted with Claude Code)
 **Last updated:** 2026-09-07
+**Platform:** Mobile native (iOS + Android) for v1 — no web client in MVP.
+**Moderation:** Automated-first — photo screening, selfie verification, and
+report triage are automated pipelines, with a manual queue only as a
+fallback for edge cases (see §8).
 
 ## 1. Concept
 
@@ -58,9 +62,12 @@ is the core mechanic.
 5. **Profile management & safety**
    - Edit profile/interests any time (triggers re-scoring).
    - Report/block a user → hides them from discovery for the reporter
-     immediately and flags for moderation review.
-   - Photo verification (selfie-vs-profile-photo check) to reduce fake
-     accounts.
+     immediately and is auto-triaged (see §8); repeat/severe cases
+     auto-suspend pending appeal.
+   - Automated photo verification: a selfie captured in-app is matched
+     against the profile photos (liveness + face-match) to grant a
+     "Verified" badge and reduce fake accounts, with no manual step in
+     the common case.
 
 ## 3. Core features (MVP scope)
 
@@ -74,9 +81,10 @@ is the core mechanic.
 | Mutual match creation | Yes | |
 | Real-time chat | Yes | WebSocket-based |
 | Icebreaker suggestions | Yes | Simple rule-based, not LLM in MVP |
-| Report / block | Yes | Required for safety/compliance |
-| Photo verification | Stretch | Manual review queue acceptable for MVP |
-| Push notifications | Stretch | Email fallback for MVP |
+| Report / block | Yes | Automated triage + auto-suspend thresholds |
+| Automated photo moderation (NSFW/graphic content) | Yes | Runs synchronously on upload, before a photo is visible |
+| Automated selfie verification (liveness + face-match) | Yes | Grants "Verified" badge; manual queue only for edge cases |
+| Push notifications | Yes | Native (APNs/FCM), core to a mobile-native app |
 | Video chat | Post-MVP | |
 | Paid tiers (boosts, extra super likes) | Post-MVP | |
 
@@ -116,7 +124,35 @@ photos (
   user_id UUID REFERENCES users(id),
   url TEXT,
   position SMALLINT,
-  is_primary BOOLEAN
+  is_primary BOOLEAN,
+  moderation_status TEXT CHECK (moderation_status IN
+    ('pending','approved','rejected')) DEFAULT 'pending',
+  moderation_result JSONB NULL,   -- raw classifier labels/scores
+  moderated_at TIMESTAMPTZ NULL
+)
+
+-- Automated selfie verification
+verifications (
+  id UUID PK,
+  user_id UUID REFERENCES users(id),
+  selfie_url TEXT,
+  status TEXT CHECK (status IN
+    ('pending','verified','failed','manual_review')) DEFAULT 'pending',
+  match_score FLOAT NULL,        -- face-match confidence
+  liveness_passed BOOLEAN NULL,
+  created_at TIMESTAMPTZ,
+  resolved_at TIMESTAMPTZ NULL
+)
+
+-- Push notification device registration (mobile-native)
+push_tokens (
+  id UUID PK,
+  user_id UUID REFERENCES users(id),
+  platform TEXT CHECK (platform IN ('ios','android')),
+  token TEXT,
+  created_at TIMESTAMPTZ,
+  last_seen_at TIMESTAMPTZ,
+  UNIQUE (platform, token)
 )
 
 -- Discovery preferences
@@ -190,7 +226,9 @@ reports (
   reported_id UUID REFERENCES users(id),
   reason TEXT,
   details TEXT,
-  status TEXT CHECK (status IN ('open','reviewing','resolved')),
+  severity_score FLOAT NULL,      -- rule-based auto-triage score
+  status TEXT CHECK (status IN
+    ('open','auto_suspended','manual_review','resolved')),
   created_at TIMESTAMPTZ
 )
 
@@ -268,9 +306,15 @@ GET    /quiz/questions
 GET    /me/quiz-answers
 PUT    /me/quiz-answers
 
-POST   /photos                     (upload)
+POST   /photos                     (upload; triggers automated moderation)
 DELETE /photos/:id
 PATCH  /photos/:id/position
+
+POST   /verification/selfie        (submit selfie; runs liveness + face-match)
+GET    /me/verification
+
+POST   /devices                    (register push token: platform, token)
+DELETE /devices/:token
 
 GET    /discovery/batch            (today's ranked candidates)
 POST   /discovery/swipe            { target_id, action }
@@ -291,51 +335,97 @@ tables (no separate message queue needed at MVP scale).
 
 ## 7. Tech stack
 
-- **Frontend:** React (Vite), React Router, a component library (or
-  Tailwind) for styling, WebSocket client for chat.
+- **Mobile client:** React Native (Expo, managed workflow to start —
+  matches the React preference already set for this project; can move
+  to a bare workflow or a fully native rewrite later if a specific
+  native module demands it). Native camera access for the selfie
+  verification flow, native push (APNs/FCM, via Expo's push service as
+  a thin abstraction over both), WebSocket client for chat.
 - **Backend:** Node.js + Express, REST + WebSocket (e.g. `ws` or
   `socket.io`).
 - **Database:** PostgreSQL (+ PostGIS extension for geo queries).
 - **Auth:** JWT access/refresh tokens, bcrypt/argon2 password hashing.
-- **File storage:** S3-compatible object storage for photos.
+- **File storage:** S3-compatible object storage for photos and
+  selfie captures.
+- **Automated moderation & verification:** a pluggable service
+  interface (`ModerationProvider`) so the actual vendor is swappable —
+  called synchronously on photo upload (NSFW/graphic-content
+  classification) and on selfie submission (liveness detection +
+  face-match against profile photos). No specific vendor is picked yet
+  (see open questions); candidates include a managed content-safety
+  API or a self-hosted classifier, and a liveness/face-match API or
+  library, evaluated on cost, accuracy, and data-residency fit for the
+  launch market.
+- **Push delivery:** APNs (iOS) + FCM (Android), abstracted behind a
+  single `push_tokens`-driven send function on the backend.
 - **Background jobs:** a simple job runner (e.g. `node-cron` or a queue
-  like BullMQ/Redis) for the nightly compatibility scoring batch.
+  like BullMQ/Redis) for the nightly compatibility scoring batch and
+  for async moderation retries/escalation.
 
 ## 8. Trust, safety & compliance considerations
 
-- Minimum age enforcement (18+) with birthdate verification.
+Automated-first, with a manual queue as a fallback net rather than the
+default path:
+
+- **Minimum age enforcement** (18+) with birthdate verification at
+  signup.
+- **Automated photo moderation:** every upload runs through an
+  NSFW/graphic-content classifier before `photos.moderation_status`
+  flips to `approved` and the photo becomes visible to other users.
+  Clear-cut rejections are automatic (uploader is notified, no human
+  in the loop); only genuinely borderline scores route to a manual
+  review queue.
+- **Automated selfie verification:** liveness detection + face-match
+  against the account's profile photos runs on submission. A
+  confident pass auto-grants the "Verified" badge; a confident fail
+  prompts a retake; only repeated or ambiguous failures escalate to
+  `manual_review`.
+- **Automated report triage:** each report gets a rule-based
+  `severity_score` (reason weight, reporter/reported history, report
+  frequency). Scores above a threshold auto-suspend the account
+  pending appeal with no human step; low-confidence or first-time
+  cases queue for lightweight manual review rather than auto-deciding.
 - Report/block flows must be reachable from every surface showing
   another user (profile card, chat thread).
-- Manual moderation queue for reports; auto-suspend on repeated reports
-  above a threshold pending review.
-- Photo moderation (basic automated NSFW screening + manual review for
-  flagged content) before a photo is shown to other users.
-- Data privacy: location stored at reduced precision for anything shown
-  to other users (approximate distance, not exact coordinates);
-  location-based features must present accordingly.
-- Clear data-deletion path (account deletion removes/anonymizes
-  profile, photos, messages within a defined retention window).
+- **Data privacy:** location stored at reduced precision for anything
+  shown to other users (approximate distance, not exact coordinates);
+  location-based features must present accordingly. Selfie captures
+  and moderation provider responses are retained only as long as
+  needed to resolve verification/appeals, not indefinitely.
+- **Clear data-deletion path:** account deletion removes/anonymizes
+  profile, photos, selfie captures, and messages within a defined
+  retention window.
+- **Vendor risk:** since moderation/verification calls a third-party
+  (or self-hosted) classifier, define a fail-safe default — e.g. a
+  provider outage routes photos/selfies to `manual_review` rather than
+  auto-approving or silently blocking uploads.
 
 ## 9. Suggested milestones
 
-1. **M0 — Foundations:** auth, profile CRUD, interest taxonomy admin,
-   Postgres schema + migrations.
+1. **M0 — Foundations:** React Native app scaffold (iOS + Android),
+   auth, profile CRUD, interest taxonomy admin, Postgres schema +
+   migrations.
 2. **M1 — Discovery core:** quiz, preferences, candidate filtering,
    scoring batch job, `/discovery/batch` + swipe endpoints.
 3. **M2 — Matching & chat:** match creation, REST message history,
-   WebSocket real-time delivery.
-4. **M3 — Safety:** reporting, blocking, moderation queue, basic photo
-   screening.
-5. **M4 — Polish:** icebreaker prompts, push/email notifications,
-   onboarding UX pass.
-6. **Post-MVP:** photo verification, paid tiers, learned ranking model,
-   video chat.
+   WebSocket real-time delivery, native push (APNs/FCM) for new
+   matches and messages.
+4. **M3 — Automated safety pipeline:** integrate the moderation
+   provider behind `ModerationProvider`; wire automated NSFW photo
+   screening, selfie liveness/face-match verification, and rule-based
+   report auto-suspend; stand up the manual-review queue as the
+   fallback path only.
+5. **M4 — Polish:** icebreaker prompts, onboarding UX pass,
+   notification preferences.
+6. **Post-MVP:** paid tiers, learned ranking model, video chat.
 
 ## 10. Open questions for you
 
-- Target platforms for v1: web only, or web + native mobile from day one?
 - Any existing brand/name preference, or is "Kindred" just a placeholder?
-- Do you want moderation to be fully manual at MVP, or is an
-  automated NSFW/abuse screening API in scope for v1?
+- Any preference on the moderation/verification vendor (a managed
+  content-safety + liveness/face-match API, vs. self-hosted models),
+  or should this stay vendor-agnostic/pluggable in the design until
+  you pick one?
 - Any geographic launch market that drives compliance needs (age
-  verification laws, data residency, etc.)?
+  verification laws, data residency, biometric-data regulations for
+  the selfie face-match step)?
